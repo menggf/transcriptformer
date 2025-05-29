@@ -80,7 +80,6 @@ class Transcriptformer(pl.LightningModule):
         )
         # Load the auxiliary vocab if provided
         if self.aux_vocab_dict is not None:
-            self.model_config.use_aux = True
             self.aux_vocab = AuxVocab(
                 vocab_dict=self.aux_vocab_dict,
                 vocab_size=sum([len(v) + 1 for v in self.aux_vocab_dict.values()]),
@@ -89,7 +88,7 @@ class Transcriptformer(pl.LightningModule):
             )
 
     def _init_model_components(self):
-        if self.model_config.use_aux:
+        if hasattr(self, "aux_vocab") and self.aux_vocab is not None:
             self._init_aux_embeddings()
 
         # Encoder and heads
@@ -214,6 +213,40 @@ class Transcriptformer(pl.LightningModule):
 
         return score_mod
 
+    def _create_cge_dict(self, gene_output, gene_token_indices, pad_mask):
+        """Create contextual gene embeddings as dictionaries mapping gene_id to embedding.
+
+        Args:
+            gene_output: Transformer output for genes (batch_size, seq_len, embed_dim)
+            gene_token_indices: Gene token indices for each position (batch_size, seq_len)
+            pad_mask: Padding mask (batch_size, seq_len) - True for valid positions
+
+        Returns
+        -------
+            List of dictionaries, one per cell, mapping gene_id to embedding
+        """
+        batch_size, seq_len, embed_dim = gene_output.shape
+        cge_dicts = []
+
+        # Create reverse mapping from token index to gene name
+        idx_to_gene = {idx: gene for gene, idx in self.gene_vocab_dict.items()}
+
+        for i in range(batch_size):
+            cell_dict = {}
+            for j in range(seq_len):
+                if pad_mask[i, j]:  # Only include non-padded positions
+                    token_idx = gene_token_indices[i, j].item()
+                    gene_name = idx_to_gene.get(token_idx, "unknown")
+
+                    # Skip special tokens
+                    if gene_name not in ["[PAD]", "[START]", "[END]", "[MASK]", "[CELL]", "[RD]", "unknown"]:
+                        # Convert embedding to numpy and store
+                        embedding = gene_output[i, j].detach().cpu().numpy()
+                        cell_dict[gene_name] = embedding
+            cge_dicts.append(cell_dict)
+
+        return cge_dicts
+
     def forward(
         self,
         batch: BatchData,
@@ -233,7 +266,7 @@ class Transcriptformer(pl.LightningModule):
                 - mu: Predicted rate of count distribution
                 - mask: Output mask
                 - input_counts: Input count data
-                - embeddings: Optional cell embeddings
+                - embeddings: Optional cell embeddings or contextual gene embeddings
         """
         aux_token_indices = batch.aux_token_indices
         gene_token_indices = batch.gene_token_indices
@@ -300,7 +333,15 @@ class Transcriptformer(pl.LightningModule):
         result = {}
 
         if embed:
-            result["embeddings"] = mean_embeddings(gene_output, pad_mask).detach().cpu()
+            # Check if we should return contextual gene embeddings or cell embeddings
+            emb_type = getattr(self.inference_config, "emb_type", "cell") if self.inference_config else "cell"
+
+            if emb_type == "cge":
+                # Return contextual gene embeddings as dictionaries
+                result["embeddings"] = self._create_cge_dict(gene_output, gene_token_indices, pad_mask)
+            else:
+                # Default: return mean-pooled cell embeddings
+                result["embeddings"] = mean_embeddings(gene_output, pad_mask).detach().cpu()
 
         # Append the end token to the gene_tokens
         result["input_gene_token_indices"] = torch.cat(
@@ -429,3 +470,50 @@ class Transcriptformer(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         assert self.inference_config.output_keys, "output_keys must be set in inference_config"
         return self.inference(batch)
+
+
+class ESM2CE(Transcriptformer):
+    """ESM2-CE model."""
+
+    def forward(
+        self,
+        batch: BatchData,
+        embed: bool = False,
+        **kwargs,
+    ) -> dict:
+        """Forward pass of the model.
+
+        Args:
+            batch (BatchData): The batch data containing gene_counts and gene_token_indices.
+            embed (bool): Whether to return embeddings.
+
+        Returns
+        -------
+            dict: The model output consisting of keys:
+                - embeddings: The embeddings if embed is True.
+                - input_counts: The input count data.
+                - mask: The mask for the output.
+        """
+        gene_counts = batch.gene_counts
+        gene_token_indices = batch.gene_token_indices
+
+        # Embed the gene_tokens
+        gene_embeddings = self.gene_embeddings(gene_token_indices, embed_only=True)
+        pad_mask = self._pad_mask(gene_token_indices, dtype="bool")
+
+        result = {}
+        result["input_counts"] = gene_counts
+        result["mask"] = ~self._pad_mask(gene_token_indices, dtype="bool")
+
+        if embed:
+            # Check if we should return contextual gene embeddings or cell embeddings
+            emb_type = getattr(self.inference_config, "emb_type", "cell") if self.inference_config else "cell"
+
+            if emb_type == "cge":
+                # Return contextual gene embeddings as dictionaries
+                result["embeddings"] = self._create_cge_dict(gene_embeddings, gene_token_indices, pad_mask)
+            else:
+                # Default: return mean-pooled cell embeddings
+                result["embeddings"] = mean_embeddings(gene_embeddings, pad_mask).detach().cpu()
+
+        return result

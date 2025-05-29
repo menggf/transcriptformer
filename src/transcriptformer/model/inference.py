@@ -2,10 +2,10 @@ import logging
 import warnings
 
 import anndata
+import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from hydra.utils import instantiate
 from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
@@ -41,10 +41,26 @@ def run_inference(cfg, data_files: list[str] | list[anndata.AnnData]):
     # Load vocabs and embeddings
     (gene_vocab, aux_vocab), emb_matrix = load_vocabs_and_embeddings(cfg)
 
-    # Instantiate the model
-    logging.info("Instantiating the model")
-    model = instantiate(
-        cfg.model,
+    # Determine model class based on config
+    model_type = cfg.model.get("model_type", "transcriptformer")  # Default to transcriptformer if not set
+    if model_type == "esm2ce":
+        from transcriptformer.model.model import ESM2CE as ModelClass
+
+        logging.info("Instantiating ESM2CE model")
+    elif model_type == "transcriptformer":
+        from transcriptformer.model.model import Transcriptformer as ModelClass
+
+        logging.info("Instantiating Transcriptformer model")
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    # Instantiate the selected model
+    logging.info(f"Instantiating the {model_type} model")
+    model = ModelClass(
+        data_config=cfg.model.data_config,
+        model_config=cfg.model.model_config,
+        loss_config=cfg.model.loss_config,
+        inference_config=cfg.model.inference_config,
         gene_vocab_dict=gene_vocab,
         aux_vocab_dict=aux_vocab,
         emb_matrix=emb_matrix,
@@ -133,7 +149,43 @@ def run_inference(cfg, data_files: list[str] | list[anndata.AnnData]):
     # Add all other output keys to the obsm
     for k in cfg.model.inference_config.output_keys:
         if k in concat_output:
-            obsm[k] = concat_output[k].numpy()
+            if k == "embeddings" and cfg.model.inference_config.emb_type == "cge":
+                # Handle contextual gene embeddings - store in a flattened format for HDF5 compatibility
+                cge_list = concat_output[k]
+
+                # Flatten all embeddings and track their metadata
+                all_embeddings = []
+                cell_indices = []
+                gene_names = []
+
+                for cell_idx, cell_dict in enumerate(cge_list):
+                    for gene_name, embedding in cell_dict.items():
+                        all_embeddings.append(embedding)
+                        cell_indices.append(cell_idx)
+                        gene_names.append(gene_name)
+
+                # Convert to numpy arrays
+                if all_embeddings:
+                    embeddings_array = np.stack(all_embeddings)
+                    cell_indices_array = np.array(cell_indices)
+                    gene_names_array = np.array(gene_names)
+
+                    # Store in uns (unstructured data)
+                    if uns is None:
+                        uns = {}
+                    uns["cge_embeddings"] = embeddings_array
+                    uns["cge_cell_indices"] = cell_indices_array
+                    uns["cge_gene_names"] = gene_names_array
+                else:
+                    # Handle empty case
+                    if uns is None:
+                        uns = {}
+                    uns["cge_embeddings"] = np.array([])
+                    uns["cge_cell_indices"] = np.array([])
+                    uns["cge_gene_names"] = np.array([])
+            else:
+                # Regular embeddings or other outputs
+                obsm[k] = concat_output[k].numpy() if hasattr(concat_output[k], "numpy") else concat_output[k]
 
     # Create a new AnnData object with the embeddings
     output_adata = anndata.AnnData(
